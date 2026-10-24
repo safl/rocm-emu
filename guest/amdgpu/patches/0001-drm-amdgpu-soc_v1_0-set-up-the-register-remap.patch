@@ -1,0 +1,20 @@
+drm/amdgpu: set up the register remap on SOC v1.0
+
+soc_v1_0_common_early_init() never calls nbio set_reg_remap(), unlike nv,
+soc15, soc21 and soc24, so rmmio_remap.bus_addr stays 0 on GC 12.1. KFD then
+refuses ROCr's allocation of the MMIO remap page (AMDKFD_IOC_ALLOC_MEMORY_OF_GPU
+returns -ENOMEM) and the thunk fails with "Failed to map remapped mmio page".
+
+Still missing on mainline at the 2026-10-21 drm-next merge.
+
+--- a/drivers/gpu/drm/amd/amdgpu/soc_v1_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc_v1_0.c
+@@ -288,6 +288,8 @@
+ 
+ 	adev->asic_funcs = &soc_v1_0_asic_funcs;
+ 
++	adev->nbio.funcs->set_reg_remap(adev);
++
+ 	adev->rev_id = amdgpu_device_get_rev_id(adev);
+ 	adev->external_rev_id = 0xff;
+ 

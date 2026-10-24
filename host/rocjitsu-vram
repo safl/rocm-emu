@@ -1,0 +1,12 @@
+#!/bin/sh
+# Print the path through which another process can map a running rocjitsu
+# server's VRAM: the memfd that backs its VRAM BAR, from offset 0.
+#
+#   rocjitsu-vram <pid>
+#
+# rocm-ernic takes it as --peer-memory "$(rocjitsu-vram <pid>):<BAR size>".
+set -eu
+pid=${1:?usage: rocjitsu-vram <pid>}
+path=$(find "/proc/$pid/fd" -lname '/memfd:rocjitsu-vram*' 2>/dev/null | head -n 1)
+[ -n "$path" ] || { echo "rocjitsu-vram: no VRAM memfd in process $pid" >&2; exit 1; }
+echo "$path"

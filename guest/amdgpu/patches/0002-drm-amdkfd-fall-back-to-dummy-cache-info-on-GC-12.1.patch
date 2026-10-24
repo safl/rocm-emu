@@ -1,0 +1,23 @@
+drm/amdkfd: fall back to the dummy cache info on GC 12.1
+
+GC 12.1 takes its cache sizes from the GC info table of IP discovery. A table
+of version 2.0 has none, as rocjitsu's ip_discovery.bin does, so KFD reports no
+caches and a ROCr built with asserts aborts with "GPU cache info missing".
+Use dummy_cache_info then, as every IP version without a table does.
+
+The proper fix is rocjitsu emitting GC info v2.1; this carries the guest until
+it does.
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_crat.c
+@@ -1738,6 +1738,10 @@
+ 				kfd_fill_gpu_cache_info_from_gfx_config(kdev->kfd,
+ 									cache_line_size_missing,
+ 									*pcache_info);
++			if (!num_of_cache_types) {
++				*pcache_info = dummy_cache_info;
++				num_of_cache_types = ARRAY_SIZE(dummy_cache_info);
++			}
+ 			break;
+ 		default:
+ 			*pcache_info = dummy_cache_info;
