@@ -1,0 +1,128 @@
+---
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The packages only change with their pins and build scripts, so a cache hit
+  # skips the build; make's stamps would not, since checkout resets mtimes.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Cache the packages
+      id: cache
+      uses: actions/cache@v6.1.0
+      with:
+        path: out
+        key: pkgs-${{ hashFiles('versions.env', 'Makefile', 'host/**', 'guest/**') }}
+
+    - name: Build the packages
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: make
+
+    - name: Upload the packages
+      uses: actions/upload-artifact@v6.0.0
+      with:
+        name: rocm-emu-debs
+        path: out/**/*.deb
+        if-no-files-found: error
+
+  # As xNVMe's verify-ernic: cijoe in nosi's docker image on a stock runner,
+  # the guest on its KVM.
+  verify:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    container:
+      image: ghcr.io/safl/nosi/ubuntu-2604-docker:latest
+      # /mnt is the runner's ~70 GiB ephemeral disk; the nosi qcow2 + raw
+      # decompression overflow the container's small overlay otherwise.
+      options: --privileged -v /mnt:/mnt
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Retrieve the packages
+      uses: actions/download-artifact@v7.0.0
+      with:
+        name: rocm-emu-debs
+        path: /tmp/debs
+
+    - name: Install rocjitsu-host, stage the guest packages
+      run: |
+        mkdir -p /tmp/artifacts
+        find /tmp/debs -name 'rocjitsu-guest-*.deb' -exec cp {} /tmp/artifacts \;
+        ls /tmp/artifacts
+        DEBIAN_FRONTEND=noninteractive apt-get -qy update
+        DEBIAN_FRONTEND=noninteractive apt-get -qy install $(find /tmp/debs -name 'rocjitsu-host_*.deb')
+
+    - name: CIJOE, install
+      run: |
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+        pipx install ./cijoe --include-deps --force
+
+    - name: Stage artifacts on /mnt
+      run: |
+        mkdir -p /mnt/system_imaging /mnt/guests
+        ln -s /mnt/system_imaging "$HOME/system_imaging"
+        ln -s /mnt/guests "$HOME/guests"
+
+    - name: rocm-ernic, server revisions
+      id: ernic-rev
+      run: |
+        python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+        import tomllib
+        cfg = tomllib.load(open("cijoe/configs/ubuntu-2610-rocm-gpu.toml", "rb"))["rocm_ernic"]
+        print(f"key={cfg['sha']}-{cfg['libvfio_user']['sha']}")
+        EOF
+
+    # rocm_ernic_build skips the build when the cached server's stamp matches
+    - name: rocm-ernic, cache the server build
+      uses: actions/cache@v6.1.0
+      with:
+        path: |
+          ~/opt/rocm-ernic/bin
+          ~/opt/rocm-ernic/lib
+        key: rocm-ernic-${{ steps.ernic-rev.outputs.key }}-${{ hashFiles('cijoe/scripts/rocm_ernic_build.py', 'patches/rocm-ernic/**') }}
+
+    - name: CIJOE, start the guest, attach the GPU and test
+      run: |
+        make verify CIJOE_OUTPUT="${{ github.job }}"
+
+    - name: Collect the guest serial console and the server logs
+      if: always()
+      run: |
+        for f in "$HOME/guests/ubuntu-2610-rocm-amd64/serial.output" \
+          /tmp/vfio-user-rocjitsu.log /tmp/vfio-user-rocm-ernic.log; do
+          echo "::group::$f (tail)"
+          tail -c 20000 "$f" 2>/dev/null || echo "missing"
+          echo "::endgroup::"
+          cp "$f" "cijoe/${{ github.job }}-$(basename "$f")" 2>/dev/null || true
+        done
+
+    - name: CIJOE, upload the report and logs
+      if: always()
+      uses: actions/upload-artifact@v6.0.0
+      with:
+        name: ${{ github.job }}-report
+        path: |
+          cijoe/${{ github.job }}/report.html
+          cijoe/${{ github.job }}-*
+        if-no-files-found: warn
