@@ -1,10 +1,30 @@
-# rocjitsu packages
+# rocm-emu
 
-Packages for running rocjitsu, ROCm's emulated AMD GPU, as a vfio-user device
-beside a QEMU guest, and for qualifying it from inside that guest. The guest
-is nosi's `ubuntu-2610-rocm`; nothing here is baked into that image, which is
-also flashed onto machines with real GPUs, so the guest packages are installed
-at test time into a throwaway guest.
+An emulated AMD GPU and an emulated RDMA NIC in one QEMU guest, the NIC doing
+DMA into the GPU's VRAM, on stock QEMU and a stock GitHub runner. The GPU is
+rocjitsu, ROCm's GPU emulator, served over vfio-user; the NIC is
+[rocm-ernic](https://github.com/ROCm/rocm-ernic); the guest is nosi's
+`ubuntu-2610-rocm`. This is where it gets proven before it goes into xNVMe's
+CI, beside the rocm-ernic job there, for testing device paths into GPU memory
+without a GPU.
+
+What it took, and what is still wrong, is in [docs/findings.md](docs/findings.md).
+
+## What is here
+
+| Path                     | What                                                                    |
+| ------------------------ | ----------------------------------------------------------------------- |
+| `host/`, `guest/`        | the packages, below                                                     |
+| `patches/rocm-ernic/`    | `--peer-memory`, the rocm-ernic change NIC to GPU DMA needs; carried until upstream |
+| `cijoe/`                 | the check, as cijoe configs, scripts and a workflow laid out as xNVMe's |
+| `.github/workflows/`     | builds the packages, then runs the check                                |
+| `docs/`                  | findings, and a rocjitsu bug report not yet filed                       |
+
+The cijoe pieces are xNVMe's: `rocm_ernic_build.py` and `root_unlock.py` are
+from xNVMe's `cijoe/scripts` (the former extended to apply patches), and
+`rocjitsu_guest_start.py` follows its `xnvme_guest_start_nvme.py`.
+
+## Packages
 
 | Package                                  | Where   | What                                                                     |
 | ---------------------------------------- | ------- | ------------------------------------------------------------------------ |
@@ -13,65 +33,42 @@ at test time into a throwaway guest.
 | `rocjitsu-guest-amdgpu-<kernel>`         | guest   | `amdgpu.ko` for exactly that kernel, with the GC 12.1 fixes              |
 | `rocjitsu-guest-tests`                   | guest   | `rocjitsu-guest-check gemm` and `rocjitsu-guest-check p2p`               |
 
-`versions.env` holds every pin. The amdgpu package is built from the guest
-release's own `linux-source` at the version of the image's kernel, so it moves
-whenever the image's kernel does; the firmware package carries the
+Nothing is baked into the nosi image, which is also flashed onto machines with
+real GPUs; the guest packages are installed at test time into a throwaway
+guest. `versions.env` holds every pin. The amdgpu package is built from the
+guest release's own `linux-source` at the version of the image's kernel, so it
+moves whenever the image's kernel does; the firmware package carries the
 `ip_discovery.bin` of the server build, so it moves with `rocjitsu-host`.
 
-## Building
+## Running it
 
 ```sh
-make            # everything, into out/
-make guest-amdgpu
+make                      # the packages, into out/, each in a container of its release
 ```
 
-Each package builds in a container of the Ubuntu release it targets, so
-Docker is the only requirement. The rocjitsu configure step fetches
-libvfio-user and json-c.
-
-## Using
-
-On the host, start the server, then give QEMU an empty slot to hot-plug it
-into later:
+The check wants a Linux host with KVM, QEMU 10.1 or later, oras and pipx, as
+in nosi's `ubuntu-2604-docker` image, which CI runs it in:
 
 ```sh
-/opt/rocjitsu/bin/rocjitsu --config /opt/rocjitsu/share/configs/gfx1250_mi455x.json \
-	--vfio-socket /run/rocjitsu/gpu0.sock
+sudo apt install ./out/host/rocjitsu-host_*.deb
+mkdir -p /tmp/artifacts && cp out/guest-*/*.deb /tmp/artifacts
+pipx install ./cijoe --include-deps
+make verify
 ```
 
-In the guest, install the guest packages and load amdgpu before the GPU
-appears. udevd reads `modprobe.d` once at start, so a hot-plugged GPU would
-otherwise probe without the options:
+It starts both servers and the guest, installs the guest packages, loads
+amdgpu and hot-plugs the GPU, then runs the GEMM and the P2P check, and fails
+unless the NIC's server logs serving DMA from the GPU's VRAM.
 
-```sh
-apt install ./rocjitsu-guest-firmware_*.deb ./rocjitsu-guest-amdgpu-*.deb ./rocjitsu-guest-tests_*.deb
-modprobe amdgpu
-```
+To do it by hand: the GPU must be hot-plugged after `modprobe amdgpu`, over
+QMP, onto a downstream port of the same PCIe switch as the NIC, and the NIC's
+server needs `--peer-memory "$(rocjitsu-vram <rocjitsu pid>):256M"`.
+`cijoe/scripts/rocjitsu_guest_start.py` has the QEMU arguments.
 
-Then hot-plug the GPU over QMP (HMP's `device_add` cannot express the
-socket), and check it from the guest:
+## Licensing
 
-```json
-{"execute": "device_add", "arguments": {"driver": "vfio-user-pci", "id": "gpu0",
- "bus": "<slot>", "rombar": 0, "socket": {"type": "unix", "path": "/run/rocjitsu/gpu0.sock"}}}
-```
-
-```sh
-rocjitsu-guest-check gemm
-```
-
-## Peer-to-peer
-
-NIC to GPU DMA works on stock QEMU. Two things make it so. The NIC and the
-GPU sit on two downstream ports of one emulated PCIe switch
-(`x3130-upstream`, `xio3130-downstream`), so the guest kernel's
-`pci_p2pdma_distance()` allows it without the q35 host bridge being on its
-whitelist. And the NIC's server maps the GPU's VRAM itself: QEMU tells it
-where the GPU's BAR is, as a DMA region without a file descriptor, and
-`rocjitsu-vram <pid>` names the memfd behind it. For rocm-ernic that is
-`--peer-memory "$(rocjitsu-vram <pid>):256M"`, which rocm-ernic does not have
-yet.
-
-`rocjitsu-guest-check p2p` registers its VRAM buffer before HIP creates any
-queue. Pinning it for the NIC moves it, KFD evicts the process's queues, and
-under rocjitsu they do not resume.
+BSD-3-Clause (`LICENSE`), except where a file says otherwise:
+`guest/firmware/vfio_guest_firmware.py` is AMD's, MIT, vendored from
+ROCm/rocm-systems `730bc62`; `guest/tests/rdma_p2p.hip` is GPL-2.0-or-later,
+following rocm-ernic's tests; the patches are under the licenses of what they
+patch.
