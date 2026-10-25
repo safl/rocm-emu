@@ -76,7 +76,9 @@ def setup_rocjitsu(cijoe):
         log.error(f"no {binary}; install the rocjitsu-host package")
         return None
 
-    cijoe.run_local(f"pkill -f '{binary} .*--vfio-socket {socket}' || true")
+    # Anchored, so as not to match the shell running the command
+    pattern = f"^{binary} .*--vfio-socket {socket}"
+    cijoe.run_local(f"pkill -f '{pattern}' || true")
     err = start_detached(
         cijoe,
         f"{binary} --config {cijoe.getconf('rocjitsu.config')} --vfio-socket {socket}",
@@ -89,7 +91,7 @@ def setup_rocjitsu(cijoe):
 
     err, state = cijoe.run_local(
         f"{cijoe.getconf('rocjitsu.vram_bin')} "
-        f"\"$(pgrep -nf -- '--vfio-socket {socket}')\""
+        f"\"$(pgrep -nf '{pattern}')\""
     )
     if err:
         log.error("could not find rocjitsu's VRAM memfd")
@@ -113,7 +115,7 @@ def setup_rocm_ernic(cijoe, peer_memory):
     log_level = cijoe.getconf("rocm_ernic.log_level", "warn")
     log_path = Path(socket).with_suffix(".log")
 
-    cijoe.run_local(f"pkill -f '{binary} --socket {socket}' || true")
+    cijoe.run_local(f"pkill -f '^{binary} --socket {socket}' || true")
     err = start_detached(
         cijoe,
         f"{binary} --socket {socket} --backend '{backend}' "

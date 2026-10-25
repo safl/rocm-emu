@@ -71,9 +71,8 @@ def main(args, cijoe):
         return errno.ENOENT
 
     for deb in debs:
-        err, _ = cijoe.put(str(deb), f"/tmp/{deb.name}")
-        if err:
-            return err
+        if not cijoe.put(str(deb), f"/tmp/{deb.name}"):
+            return errno.EIO
 
     err, _ = cijoe.run(
         "DEBIAN_FRONTEND=noninteractive apt-get -qy update && "
