@@ -5,7 +5,7 @@ DOCKER ?= docker
 OUT ?= $(CURDIR)/out
 RUN = $(DOCKER) run --rm -v $(CURDIR):/src:ro
 
-.PHONY: all host guest-firmware guest-amdgpu guest-tests clean
+.PHONY: all host guest-firmware guest-amdgpu guest-tests verify clean
 
 all: host guest-firmware guest-amdgpu guest-tests
 
@@ -29,6 +29,15 @@ guest-amdgpu:
 guest-tests:
 	mkdir -p $(OUT)/guest-tests
 	$(RUN) -v $(OUT)/guest-tests:/out ubuntu:$(HOST_RELEASE) bash /src/guest/tests/build.sh /out
+
+# Run the cijoe workflow against the packages in /tmp/artifacts, with
+# rocjitsu-host installed; this is what CI runs.
+CIJOE_OUTPUT ?= cijoe-output
+verify:
+	cd cijoe && cijoe workflows/test-ubuntu-2610-rocm-gpu.yaml --monitor \
+		--config configs/ubuntu-2610-rocm-gpu.toml \
+		--config configs/system_imaging.toml \
+		--output $(CIJOE_OUTPUT)
 
 clean:
 	rm -rf $(OUT)

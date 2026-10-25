@@ -1,1 +1,4 @@
 out/
+cijoe/cijoe-output*/
+cijoe/verify/
+cijoe/*.egg-info/

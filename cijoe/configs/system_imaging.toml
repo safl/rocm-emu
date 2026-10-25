@@ -1,0 +1,9 @@
+# The oras digest is the .img.gz layer's, not the manifest's; this is
+# ubuntu-2610-rocm:2026.W43, as xNVMe pins it. Its kernel is the one the
+# rocjitsu-guest-amdgpu package is built for (versions.env, GUEST_KVER), and
+# its ionic driver is from the rocm-ernic revision in ubuntu-2610-rocm-gpu.toml.
+[system-imaging.images.ubuntu-2610-rocm-x86_64]
+system_label = "x86_64"
+
+oras.url = "oras://ghcr.io/safl/nosi/ubuntu-2610-rocm@sha256:a778f9a6ce500ca4165638b0cad7db5d3b5f34cec369df9d5d0c1c0f55213106"
+disk.path = "{{ local.env.HOME }}/system_imaging/disk/ubuntu-2610-rocm-x86_64.qcow2"

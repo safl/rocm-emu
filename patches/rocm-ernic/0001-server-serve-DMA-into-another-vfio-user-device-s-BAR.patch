@@ -1,0 +1,555 @@
+From 8fa61fa04f6081a50eb0690783ed0d35cc78a1bd Mon Sep 17 00:00:00 2001
+From: "Simon A. F. Lund" <os@safl.dk>
+Date: Sun, 25 Oct 2026 00:03:43 +0200
+Subject: [PATCH] server: serve DMA into another vfio-user device's BAR
+
+A guest that points the NIC at another device's memory, such as GPU VRAM
+registered with ibv_reg_dmabuf_mr(), gets a failed transfer when that device
+is itself a vfio-user server: QEMU shares the peer's mmap-able BAR as a DMA
+region without a file descriptor, so vfu_sgl_get() refuses it with EFAULT.
+Falling back to vfu_sgl_read()/vfu_sgl_write() does not help, since on the
+single socket those replies collide with the client's own requests, and QEMU
+has no twin socket. --peer-memory FILE:SIZE instead names the file behind
+the BAR, a peer server's memfd under /proc for example, and the server maps
+it for the first fd-less region of that size, so peer-to-peer DMA works with
+stock QEMU.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Simon A. F. Lund <os@safl.dk>
+---
+ CHANGELOG.md            |   9 +++
+ CMakeLists.txt          |   1 +
+ docs/usage.rst          |  34 ++++++++++++
+ src/ionic_datapath.c    |  12 +++-
+ src/peer_mem.c          | 119 ++++++++++++++++++++++++++++++++++++++++
+ src/peer_mem.h          |  37 +++++++++++++
+ src/rocm_ernic_server.c |  20 ++++++-
+ tests/CMakeLists.txt    |  20 +++++++
+ tests/test_peer_mem.c   | 105 +++++++++++++++++++++++++++++++++++
+ 9 files changed, 355 insertions(+), 2 deletions(-)
+ create mode 100644 src/peer_mem.c
+ create mode 100644 src/peer_mem.h
+ create mode 100644 tests/test_peer_mem.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3f27ad4..523473e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,15 @@
+ 
+ ### Added
+ 
++* `--peer-memory FILE:SIZE` serves DMA into another vfio-user device's BAR,
++  such as a GPU's VRAM a guest registers with `ibv_reg_dmabuf_mr()`. QEMU
++  shares such a BAR as a DMA region without a file descriptor, which the
++  server could not reach, so the transfer failed. Given the file that backs
++  the BAR, the server maps it for the first fd-less region of `SIZE` bytes.
++  No QEMU change is needed. See "DMA into Another Device" in the usage
++  documentation.
++* `test_peer_mem` (CTest `peer-mem-unit`) covers which DMA regions bind to a
++  peer file and the bounds of a lookup into one.
+ * The mesh backend can claim and withdraw a node's GIDs while it is running,
+   rather than only announcing the set `ERNIC_TCP_GUEST_GIDS` named at
+   startup: the claim is recorded locally and re-advertised to the mesh, and
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2230d87..11088e3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -191,6 +191,7 @@ set(IONIC_EMU_SOURCES
+     src/ionic_adminq.c
+     src/ionic_fault.c
+     src/ionic_datapath.c
++    src/peer_mem.c
+ )
+ 
+ # In-process NVMe-oF controller reached over the emulated fabric
+diff --git a/docs/usage.rst b/docs/usage.rst
+index 2250be8..5b650b4 100644
+--- a/docs/usage.rst
++++ b/docs/usage.rst
+@@ -188,6 +188,40 @@ Inside the guest, load the upstream modules and verify:
+    lspci -nnv -d 1dd8:1002 | grep '\[1dd8:5400\]'
+    ibv_devices
+ 
++DMA into Another Device
++-----------------------
++
++A guest can point the NIC at another PCI device's memory,
++for example a GPU's VRAM exported as a dma-buf and
++registered with ``ibv_reg_dmabuf_mr()``. When that device is
++also a vfio-user server, QEMU shares its BAR with this
++server as a DMA region without a file descriptor, which the
++server cannot reach on its own. Name the file that backs the
++BAR with ``--peer-memory FILE:SIZE``: the server maps
++``FILE`` from offset 0 for the first such region of exactly
++``SIZE`` bytes and serves DMA into it from there. ``SIZE``
++takes a ``K``, ``M``, ``G`` or ``T`` suffix. The option can
++be given up to four times.
++
++For a rocjitsu GPU the file is the memfd behind its VRAM
++BAR, reached through the rocjitsu process:
++
++.. code-block:: bash
++
++   vram=$(find /proc/"$(pgrep -x rocjitsu)"/fd \
++     -lname '/memfd:rocjitsu-vram*' | head -n 1)
++   ./build/rocm-ernic --socket /tmp/vfio-user-rocm-ernic.sock \
++     --backend loopback --peer-memory "$vram:256M"
++
++The server logs ``peer memory FILE serves DMA at`` when a
++region binds and ``peer memory FILE served DMA at`` on the
++first transfer through it.
++
++The guest kernel must also agree to peer-to-peer DMA between
++the two devices. Behind q35's host bridge it does when both
++sit on downstream ports of one PCIe switch, for example
++``x3130-upstream`` with two ``xio3130-downstream`` ports.
++
+ Statistics Collection
+ ---------------------
+ 
+diff --git a/src/ionic_datapath.c b/src/ionic_datapath.c
+index 821f5a8..1311e1b 100644
+--- a/src/ionic_datapath.c
++++ b/src/ionic_datapath.c
+@@ -54,6 +54,7 @@
+ #include "nvmeof.h"
+ #include "nvmeof_cm.h"
+ #include "nvmeof_target.h"
++#include "peer_mem.h"
+ #include "rocm_ernic_compat.h"
+ #include "s3_tcp.h"
+ #include "s3_target.h"
+@@ -340,8 +341,17 @@ static int dp_dma_rw(vfu_ctx_t *vfu_ctx, uint64_t gpa, void *buf, size_t len,
+     size_t nsg = (size_t)cnt;
+ 
+     if (vfu_sgl_get(vfu_ctx, sg, iov, nsg, 0) < 0) {
++        int err = errno;
++        void *peer = err == EFAULT ? ernic_peer_mem_lookup(gpa, len) : NULL;
++
+         free(sg);
+-        return -EIO;
++        if (!peer)
++            return -EIO;
++        if (write)
++            memcpy(peer, buf, len);
++        else
++            memcpy(buf, peer, len);
++        return 0;
+     }
+ 
+     for (size_t i = 0; i < nsg && done < len; i++) {
+diff --git a/src/peer_mem.c b/src/peer_mem.c
+new file mode 100644
+index 0000000..422f7fc
+--- /dev/null
++++ b/src/peer_mem.c
+@@ -0,0 +1,119 @@
++/*
++ * peer_mem.c - another device's memory, mapped beside the guest's
++ *
++ * Copyright (C) Advanced Micro Devices, Inc.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the LICENSE_GPL.md file in the top-level directory.
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include "parse_int.h"
++#include "peer_mem.h"
++
++#define PEER_MEM_MAX 4
++
++struct peer_mem {
++    char *path;
++    size_t len;
++    void *map; /* NULL until a region binds it */
++    uint64_t iova;
++    bool used; /* reported the first DMA it served */
++};
++
++/* Touched only from the libvfio-user thread, which is the only one that DMAs. */
++static struct peer_mem peers[PEER_MEM_MAX];
++static unsigned int npeers;
++
++int ernic_peer_mem_add(const char *spec)
++{
++    const char *colon = strrchr(spec, ':');
++    uint64_t len;
++    char *path;
++
++    if (npeers == PEER_MEM_MAX || !colon || colon == spec ||
++        !ernic_parse_size(colon + 1, &len) || !len)
++        return -EINVAL;
++    path = strndup(spec, (size_t)(colon - spec));
++    if (!path)
++        return -ENOMEM;
++
++    peers[npeers++] = (struct peer_mem){.path = path, .len = (size_t)len};
++    return 0;
++}
++
++void ernic_peer_mem_bind(uint64_t iova, size_t len, const void *vaddr)
++{
++    if (vaddr)
++        return;
++
++    for (unsigned int i = 0; i < npeers; i++) {
++        struct peer_mem *p = &peers[i];
++        int fd;
++
++        if (p->map || p->len != len)
++            continue;
++
++        /* Opened per bind: the backing file may be the peer server's memfd
++         * under /proc, which only exists while that server runs. */
++        fd = open(p->path, O_RDWR | O_CLOEXEC);
++        if (fd < 0) {
++            fprintf(stderr, "rocm-ernic: peer memory %s: %s\n", p->path,
++                    strerror(errno));
++            continue;
++        }
++        p->map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        close(fd);
++        if (p->map == MAP_FAILED) {
++            p->map = NULL;
++            fprintf(stderr, "rocm-ernic: peer memory %s: mmap: %s\n", p->path,
++                    strerror(errno));
++            continue;
++        }
++        p->iova = iova;
++        p->used = false;
++        fprintf(stderr, "rocm-ernic: peer memory %s serves DMA at 0x%llx+0x%zx\n",
++                p->path, (unsigned long long)iova, len);
++        return;
++    }
++}
++
++void ernic_peer_mem_unbind(uint64_t iova, size_t len)
++{
++    for (unsigned int i = 0; i < npeers; i++) {
++        struct peer_mem *p = &peers[i];
++
++        if (p->map && p->iova == iova && p->len == len) {
++            munmap(p->map, p->len);
++            p->map = NULL;
++        }
++    }
++}
++
++void *ernic_peer_mem_lookup(uint64_t gpa, size_t len)
++{
++    for (unsigned int i = 0; i < npeers; i++) {
++        struct peer_mem *p = &peers[i];
++
++        if (p->map && gpa >= p->iova && gpa - p->iova <= p->len &&
++            len <= p->len - (gpa - p->iova)) {
++            if (!p->used) {
++                p->used = true;
++                fprintf(stderr, "rocm-ernic: peer memory %s served DMA at 0x%llx\n",
++                        p->path, (unsigned long long)gpa);
++            }
++            return (char *)p->map + (gpa - p->iova);
++        }
++    }
++    return NULL;
++}
+diff --git a/src/peer_mem.h b/src/peer_mem.h
+new file mode 100644
+index 0000000..423d9af
+--- /dev/null
++++ b/src/peer_mem.h
+@@ -0,0 +1,37 @@
++/*
++ * peer_mem.h - another device's memory, mapped beside the guest's
++ *
++ * Copyright (C) Advanced Micro Devices, Inc.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the LICENSE_GPL.md file in the top-level directory.
++ */
++
++#ifndef ERNIC_PEER_MEM_H
++#define ERNIC_PEER_MEM_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/*
++ * QEMU announces another vfio-user device's mmap-able BAR as a DMA region
++ * without a file descriptor, so libvfio-user cannot reach it and a transfer
++ * into that BAR, peer-to-peer DMA, fails. When the file backing the BAR is
++ * named on the command line, the first fd-less region of the same size is
++ * served from a mapping of that file instead.
++ */
++
++/* Parse "<path>:<size>", the size as ernic_parse_size() takes it. The file
++ * is mapped from offset 0. */
++int ernic_peer_mem_add(const char *spec);
++
++/* Called from the DMA (un)registration callbacks with every region. */
++void ernic_peer_mem_bind(uint64_t iova, size_t len, const void *vaddr);
++void ernic_peer_mem_unbind(uint64_t iova, size_t len);
++
++/* Host address of [@gpa, @gpa + @len) when a bound peer covers it, or NULL. */
++void *ernic_peer_mem_lookup(uint64_t gpa, size_t len);
++
++#endif /* ERNIC_PEER_MEM_H */
+diff --git a/src/rocm_ernic_server.c b/src/rocm_ernic_server.c
+index 91b3f8d..d50ab25 100644
+--- a/src/rocm_ernic_server.c
++++ b/src/rocm_ernic_server.c
+@@ -55,6 +55,7 @@
+ #include "p4_port.h"
+ #endif
+ #include "parse_int.h"
++#include "peer_mem.h"
+ #include "rocm-ernic-warnings.h"
+ 
+ static const char *get_backend_type_base(const char *backend_str);
+@@ -326,7 +327,8 @@ static void dma_register_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
+             "DMA region registered: iova=%p len=%zu vaddr=%p prot=%#x",
+             info->iova.iov_base, info->iova.iov_len, info->vaddr, info->prot);
+ 
+-    /* DMA regions are now available for mapping guest memory */
++    ernic_peer_mem_bind((uint64_t)(uintptr_t)info->iova.iov_base,
++                        info->iova.iov_len, info->vaddr);
+ }
+ 
+ /**
+@@ -336,6 +338,8 @@ static void dma_unregister_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
+ {
+     vfu_log(vfu_ctx, LOG_DEBUG, "DMA region unregistered: iova=%p len=%zu",
+             info->iova.iov_base, info->iova.iov_len);
++    ernic_peer_mem_unbind((uint64_t)(uintptr_t)info->iova.iov_base,
++                          info->iova.iov_len);
+ }
+ 
+ 
+@@ -827,6 +831,10 @@ static void usage(const char *progname)
+     fprintf(stderr, "                       Beats every profile; the guest "
+                     "uses at most\n");
+     fprintf(stderr, "                       one per vCPU.\n");
++    fprintf(stderr, "      --peer-memory FILE:SIZE  Serve the client's fd-less "
++                    "DMA region of SIZE\n");
++    fprintf(stderr, "                       from FILE, another device's BAR "
++                    "backing (repeatable)\n");
+     fprintf(stderr, "      --inject FAULT   Inject a fault (repeatable), as "
+                     "'SITE: PATTERN effect EFFECT'\n");
+     fprintf(stderr, "                       e.g. 'stats_vals: every 100 effect "
+@@ -1516,6 +1524,7 @@ int main(int argc, char *argv[])
+         OPT_STATS_INTERVAL,
+         OPT_ETH_QUEUES,
+         OPT_INJECT,
++        OPT_PEER_MEMORY,
+     };
+ 
+     /* Command-line option definitions */
+@@ -1536,6 +1545,7 @@ int main(int argc, char *argv[])
+         {"stats-interval-ms", required_argument, NULL, OPT_STATS_INTERVAL},
+         {"eth-queues", required_argument, NULL, OPT_ETH_QUEUES},
+         {"inject", required_argument, NULL, OPT_INJECT},
++        {"peer-memory", required_argument, NULL, OPT_PEER_MEMORY},
+ #ifdef ERNIC_HAVE_P4
+         {"p4", no_argument, NULL, 'P'},
+         {"p4-program", required_argument, NULL, 'J'},
+@@ -1682,6 +1692,14 @@ int main(int argc, char *argv[])
+             }
+             break;
+         }
++        case OPT_PEER_MEMORY:
++            if (ernic_peer_mem_add(optarg) != 0) {
++                fprintf(stderr, "Error: --peer-memory '%s': want FILE:SIZE\n",
++                        optarg);
++                dev_free(dev);
++                return EXIT_FAILURE;
++            }
++            break;
+ #ifdef ERNIC_HAVE_P4
+         case 'P':
+             p4_enabled = true;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9107e99..b12c971 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -119,6 +119,16 @@ target_include_directories(test_dma_range PRIVATE
+     ${PROJECT_SOURCE_DIR}/src
+ )
+ 
++# Peer memory: serving DMA into another device's BAR from its backing file.
++add_executable(test_peer_mem
++    test_peer_mem.c
++    ${PROJECT_SOURCE_DIR}/src/peer_mem.c
++)
++target_include_directories(test_peer_mem PRIVATE
++    ${PROJECT_SOURCE_DIR}/src
++)
++target_compile_definitions(test_peer_mem PRIVATE _GNU_SOURCE)
++
+ # -- Parser unit tests -------------------------------------------
+ # These link the wire parsers in src/net directly.
+ add_executable(test_rdma_cm_proto
+@@ -548,6 +558,7 @@ target_include_directories(ernic-test-ionic-fault PRIVATE
+ add_executable(test_ionic_cq_arm
+     test_ionic_cq_arm.c
+     ${PROJECT_SOURCE_DIR}/src/ionic_datapath.c
++    ${PROJECT_SOURCE_DIR}/src/peer_mem.c
+ )
+ target_include_directories(test_ionic_cq_arm PRIVATE
+     ${PROJECT_SOURCE_DIR}/src
+@@ -574,6 +585,7 @@ target_link_libraries(test_ionic_cq_arm PRIVATE
+ add_executable(test_ionic_rq_wrap
+     test_ionic_rq_wrap.c
+     ${PROJECT_SOURCE_DIR}/src/ionic_datapath.c
++    ${PROJECT_SOURCE_DIR}/src/peer_mem.c
+ )
+ target_include_directories(test_ionic_rq_wrap PRIVATE
+     ${PROJECT_SOURCE_DIR}/src
+@@ -867,6 +879,7 @@ set(ERNIC_TEST_TARGETS
+     test_write_imm
+     test_net_checksum
+     test_dma_range
++    test_peer_mem
+     test_rdma_cm_proto
+     test_parse_int
+     test_nvmeof_target
+@@ -965,6 +978,13 @@ add_test(
+ )
+ set_tests_properties(dma-range-unit PROPERTIES TIMEOUT 30)
+ 
++# Peer memory binding and lookup bounds unit test
++add_test(
++    NAME peer-mem-unit
++    COMMAND $<TARGET_FILE:test_peer_mem>
++)
++set_tests_properties(peer-mem-unit PROPERTIES TIMEOUT 30)
++
+ # rdma_cm protocol parser unit test (table-driven)
+ add_test(
+     NAME rdma-cm-proto-unit
+diff --git a/tests/test_peer_mem.c b/tests/test_peer_mem.c
+new file mode 100644
+index 0000000..ae5618a
+--- /dev/null
++++ b/tests/test_peer_mem.c
+@@ -0,0 +1,105 @@
++/*
++ * Unit tests for peer_mem.c, the mapping that serves DMA into another
++ * device's BAR.
++ *
++ * The peer is a memfd reached through /proc/self/fd, as a real peer server's
++ * memfd is reached through /proc/<pid>/fd. The checks cover which regions
++ * bind, that a binding reaches the file's own bytes, and the bounds of a
++ * lookup, which takes guest-controlled addresses and lengths.
++ *
++ * Copyright (C) Advanced Micro Devices, Inc.
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the LICENSE_GPL.md file in the top-level directory.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include "peer_mem.h"
++
++#define PEER_LEN 0x10000
++#define IOVA 0xe0000000000ULL
++
++static int failures;
++
++static void expect(bool ok, const char *what)
++{
++    if (ok)
++        return;
++    printf("  FAIL: %s\n", what);
++    failures++;
++}
++
++int main(void)
++{
++    char path[64], spec[96];
++    int fd = memfd_create("test-peer", 0);
++
++    printf("peer memory unit tests\n");
++    if (fd < 0 || ftruncate(fd, PEER_LEN) != 0) {
++        perror("memfd");
++        return 1;
++    }
++    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
++
++    static const char *const bad[] = {
++        "no-size", ":64K", "/x:", "/x:0", "/x:12Q", "/x:64KK",
++        "/x:99999999999999999G",
++    };
++    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++        if (ernic_peer_mem_add(bad[i]) == 0) {
++            printf("  FAIL: accepted '%s'\n", bad[i]);
++            failures++;
++        }
++    }
++
++    snprintf(spec, sizeof(spec), "%s:64K", path);
++    expect(ernic_peer_mem_add(spec) == 0, "a valid spec must be accepted");
++
++    /* Only an fd-less region of exactly the peer's size binds. */
++    ernic_peer_mem_bind(IOVA, PEER_LEN, (void *)0x1000);
++    expect(!ernic_peer_mem_lookup(IOVA, 1), "a region with a mapping must not bind");
++    ernic_peer_mem_bind(IOVA, PEER_LEN * 2, NULL);
++    expect(!ernic_peer_mem_lookup(IOVA, 1), "a region of another size must not bind");
++    ernic_peer_mem_bind(IOVA, PEER_LEN, NULL);
++
++    uint8_t *base = ernic_peer_mem_lookup(IOVA, PEER_LEN);
++    expect(base != NULL, "the whole bound region must resolve");
++    if (base) {
++        uint8_t got = 0;
++
++        base[0x1234] = 0xa5;
++        expect(pread(fd, &got, 1, 0x1234) == 1 && got == 0xa5,
++               "a write through the binding must reach the file");
++    }
++
++    expect(ernic_peer_mem_lookup(IOVA + PEER_LEN - 1, 1) == base + PEER_LEN - 1,
++           "the last byte must resolve");
++    expect(!ernic_peer_mem_lookup(IOVA + PEER_LEN - 1, 2), "one byte past the end must not resolve");
++    expect(!ernic_peer_mem_lookup(IOVA - 1, 1), "one byte below the start must not resolve");
++    expect(!ernic_peer_mem_lookup(IOVA + 1, SIZE_MAX),
++           "a length that wraps the end must not resolve");
++    expect(!ernic_peer_mem_lookup(UINT64_MAX, 1), "the top of the address space must not resolve");
++
++    /* Unbinding forgets the region; the next fd-less region takes its place. */
++    ernic_peer_mem_unbind(IOVA, PEER_LEN);
++    expect(!ernic_peer_mem_lookup(IOVA, 1), "an unbound region must not resolve");
++    ernic_peer_mem_bind(IOVA * 2, PEER_LEN, NULL);
++    expect(ernic_peer_mem_lookup(IOVA * 2 + 0x1234, 1) != NULL,
++           "a rebind at another address must resolve");
++    base = ernic_peer_mem_lookup(IOVA * 2, 1);
++    expect(base && base[0x1234] == 0xa5, "a rebind must map the same file");
++
++    if (failures) {
++        printf("FAILED: %d check(s)\n", failures);
++        return 1;
++    }
++    printf("PASSED\n");
++    return 0;
++}
+-- 
+2.53.0
+

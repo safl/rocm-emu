@@ -1,0 +1,55 @@
+---
+doc: |
+  Qualify an emulated AMD GPU and NIC to GPU DMA, on stock QEMU
+
+  Starts the rocjitsu and rocm-ernic servers and a nosi ubuntu-2610-rocm guest
+  with the NIC, installs the rocjitsu guest packages and hot-plugs the GPU.
+  Then runs a GEMM on the GPU, and RDMA WRITE, READ and SEND into and out of
+  VRAM registered as a dma-buf MR, and checks with the NIC's server that the
+  transfers went through VRAM rather than through system memory.
+
+steps:
+- name: guest_kill
+  uses: qemu.guest_kill
+  with:
+    guest_name: "{{ config.qemu.default_guest }}"
+
+- name: stage_nosi_guest
+  uses: system_imaging.diskimage_from_oras
+  with:
+    pattern: "{{ config.qemu.default_systemimage }}"
+
+- name: guest_initialize
+  uses: qemu.guest_initialize
+  with:
+    guest_name: "{{ config.qemu.default_guest }}"
+    system_image_name: "{{ config.qemu.default_systemimage }}"
+
+- name: guest_start
+  uses: rocjitsu_guest_start
+  with:
+    guest_name: "{{ config.qemu.default_guest }}"
+
+- name: root_unlock
+  uses: root_unlock
+
+- name: gpu_attach
+  uses: rocjitsu_gpu_attach
+  with:
+    guest_name: "{{ config.qemu.default_guest }}"
+
+- name: test_gemm
+  run: |
+    rocjitsu-guest-check gemm
+
+- name: test_p2p
+  run: |
+    rocjitsu-guest-check p2p {{ config.rocm_ernic.transport.ibdev }}
+
+- name: check_p2p_through_vram
+  uses: rocm_ernic_peer_check
+
+- name: guest_shutdown
+  uses: qemu.guest_kill
+  with:
+    guest_name: "{{ config.qemu.default_guest }}"
