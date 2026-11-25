@@ -3,7 +3,8 @@ doc: |
   Qualify an emulated AMD GPU and NIC to GPU DMA, on stock QEMU
 
   Starts the rocjitsu and rocm-ernic servers and a nosi ubuntu-2610-rocm guest
-  with the NIC, installs the rocjitsu guest packages and hot-plugs the GPU.
+  with the NIC, installs rocm-ernic's ionic-ernic driver and the rocjitsu guest
+  packages, and hot-plugs the GPU.
   Then runs a GEMM on the GPU, and RDMA WRITE, READ and SEND into and out of
   VRAM registered as a dma-buf MR, and checks with the NIC's server that the
   transfers went through VRAM rather than through system memory.
@@ -32,6 +33,23 @@ steps:
 
 - name: root_unlock
   uses: root_unlock
+
+# nosi's image carries only the kernel's own ionic drivers, which do not drive
+# the emulated NIC, so the guest gets rocm-ernic's ionic-ernic, built by DKMS
+# from the revision the server runs, as nosi's image used to carry it
+- name: ionic_ernic
+  run: |
+    rm -rf /opt/rocm-ernic && mkdir -p /opt/rocm-ernic
+    curl -fsSL {{ config.rocm_ernic.repository }}/archive/{{ config.rocm_ernic.sha }}.tar.gz | tar -xz -C /opt/rocm-ernic --strip-components=1
+    bash /opt/rocm-ernic/ansible/files/scripts/fetch-ionic-sources.sh --source-dir /var/tmp/ionic-src --kernel-ref v$(uname -r | cut -d. -f1-2) --patches-dir /opt/rocm-ernic/ansible/files/patches --force
+    bash /opt/rocm-ernic/ansible/files/scripts/setup-ionic-dkms.sh --source-dir /var/tmp/ionic-src --kernel-ref v$(uname -r | cut -d. -f1-2)
+    install -m 0644 /opt/rocm-ernic/udev/99-rocm-ernic.rules /etc/udev/rules.d/99-rocm-ernic.rules
+    udevadm control --reload
+    modprobe -r ionic_rdma ionic || true
+    modprobe ionic
+    modprobe ionic_rdma
+    udevadm settle
+    test -e /sys/class/infiniband/{{ config.rocm_ernic.transport.ibdev }}
 
 - name: gpu_attach
   uses: rocjitsu_gpu_attach
