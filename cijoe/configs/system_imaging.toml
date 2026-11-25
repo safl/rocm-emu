@@ -1,7 +1,8 @@
 # The oras digest is the .img.gz layer's, not the manifest's; this is
 # ubuntu-2610-rocm:2026.W48, from the nosi images under refenv. Its kernel is the one the
-# rocjitsu-guest-amdgpu package is built for (versions.env, GUEST_KVER), and
-# its ionic driver is from the rocm-ernic revision in ubuntu-2610-rocm-gpu.toml.
+# rocjitsu-guest-amdgpu package is built for (versions.env, GUEST_KVER). It
+# carries only the kernel's own ionic drivers; the workflow installs
+# rocm-ernic's ionic-ernic.
 [system-imaging.images.ubuntu-2610-rocm-x86_64]
 system_label = "x86_64"
 

@@ -37,9 +37,9 @@ system_args.raw = """\
 """
 system_args.tcp_forward = {host = 4200, guest = 22}
 
-# The server's revision matches the image's ionic driver, as in xNVMe; the
-# patches add what the NIC needs to reach the GPU, and change nothing the
-# guest's driver sees.
+# The workflow builds the guest's ionic-ernic driver from the server's
+# revision; the patches add what the NIC needs to reach the GPU, and change
+# nothing the guest's driver sees.
 [rocm_ernic]
 repository = "https://github.com/ROCm/rocm-ernic"
 sha = "cddb171f54feab119f7b6deca5c33148bb7c020d"
